@@ -26,6 +26,9 @@ class ClipError(ValueError):
     """动画或图集参数非法时抛出。"""
 
 
+_LOOP_MODES = ("once", "loop", "pingpong")
+
+
 def frame_rect(index, atlas) -> tuple:
     """返回帧 ``index`` 在图集中的像素矩形 ``(x, y, frame_w, frame_h)``。
 
@@ -36,8 +39,47 @@ def frame_rect(index, atlas) -> tuple:
     ``index`` 必须满足 ``0 <= index < cols * rows``；越界（含负数）抛
     :class:`ClipError`。
     """
+    cols = atlas["cols"]
+    rows = atlas["rows"]
+    capacity = cols * rows
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < capacity:
+        raise ClipError(f"frame index {index!r} out of range [0, {capacity})")
+    row, col = divmod(index, cols)
+    return (col * atlas["frame_w"], row * atlas["frame_h"],
+            atlas["frame_w"], atlas["frame_h"])
 
-    raise NotImplementedError
+
+def _durations(clip):
+    return [frame["duration"] for frame in clip["frames"]]
+
+
+def _cumulative_starts(durations):
+    """各帧的起始时刻（累计时长），长度与 ``durations`` 相同。"""
+    starts = []
+    acc = 0
+    for d in durations:
+        starts.append(acc)
+        acc += d
+    return starts
+
+
+def _locate(starts, t):
+    """在累计起始时刻中定位 ``t`` 所属的帧；落在帧起点取后一帧。"""
+    return bisect.bisect_right(starts, t) - 1
+
+
+def _check_clip(clip):
+    frames = clip.get("frames") or []
+    if not frames:
+        raise ClipError("frames must not be empty")
+    durations = _durations(clip)
+    total = sum(durations)
+    if total <= 0:
+        raise ClipError("total duration must be positive")
+    loop = clip.get("loop")
+    if loop not in _LOOP_MODES:
+        raise ClipError(f"unknown loop: {loop}")
+    return durations, total, loop
 
 
 def frame_at(clip, elapsed_ms) -> int:
@@ -56,8 +98,26 @@ def frame_at(clip, elapsed_ms) -> int:
 
     帧为空、总时长不为正或 ``loop`` 为未知值时抛 :class:`ClipError`。
     """
+    durations, total, loop = _check_clip(clip)
+    t = max(0, elapsed_ms)
 
-    raise NotImplementedError
+    if loop == "once":
+        if t >= total:
+            return len(durations) - 1
+        return _locate(_cumulative_starts(durations), t)
+
+    if loop == "loop":
+        return _locate(_cumulative_starts(durations), t % total)
+
+    # pingpong：展开为 [0..n-1, n-2..1]，折返点与接缝均不重复帧。
+    n = len(durations)
+    if n == 1:
+        return 0
+    expanded = list(range(n)) + list(range(n - 2, 0, -1))
+    expanded_durations = [durations[i] for i in expanded]
+    period = sum(expanded_durations)
+    idx = _locate(_cumulative_starts(expanded_durations), t % period)
+    return expanded[idx]
 
 
 def total_duration(clip) -> int:
@@ -66,8 +126,7 @@ def total_duration(clip) -> int:
     即所有帧 ``duration`` 之和，必须包含最后一帧；空动画返回 0（其非法性
     由 :func:`validate_clip` 报告）。返回值是非负整数毫秒。
     """
-
-    raise NotImplementedError
+    return sum(_durations(clip))
 
 
 def event_frames(clip, event_ms) -> list[int]:
@@ -81,8 +140,32 @@ def event_frames(clip, event_ms) -> list[int]:
     帧为空、总时长不为正或事件时间不是整数时抛 :class:`ClipError`。
     ``loop`` 不参与映射：事件时间按一遍播放的时间轴解释。
     """
+    frames = clip.get("frames") or []
+    if not frames:
+        raise ClipError("frames must not be empty")
+    durations = _durations(clip)
+    total = sum(durations)
+    if total <= 0:
+        raise ClipError("total duration must be positive")
+    starts = _cumulative_starts(durations)
+    last = len(durations) - 1
 
-    raise NotImplementedError
+    if isinstance(event_ms, (int, bool)) or not hasattr(event_ms, "__iter__"):
+        events = [event_ms]
+    else:
+        events = list(event_ms)
+
+    result = []
+    for t in events:
+        if not isinstance(t, int) or isinstance(t, bool):
+            raise ClipError(f"event time must be an integer, got {t!r}")
+        if t < 0:
+            result.append(0)
+        elif t >= total:
+            result.append(last)
+        else:
+            result.append(_locate(starts, t))
+    return result
 
 
 def sync_to_fps(clip, fps) -> list[int]:
@@ -96,8 +179,19 @@ def sync_to_fps(clip, fps) -> list[int]:
 
     帧为空、总时长不为正或 ``fps`` 不为正整数时抛 :class:`ClipError`。
     """
+    if not isinstance(fps, int) or isinstance(fps, bool) or fps <= 0:
+        raise ClipError(f"fps must be a positive integer, got {fps!r}")
+    frames = clip.get("frames") or []
+    if not frames:
+        raise ClipError("frames must not be empty")
+    durations = _durations(clip)
+    total = sum(durations)
+    if total <= 0:
+        raise ClipError("total duration must be positive")
+    starts = _cumulative_starts(durations)
 
-    raise NotImplementedError
+    count = (total * fps + 999) // 1000
+    return [_locate(starts, (k * 1000) // fps) for k in range(count)]
 
 
 def validate_clip(clip, atlas) -> list[str]:
@@ -115,8 +209,23 @@ def validate_clip(clip, atlas) -> list[str]:
 
     时长为 0（或负数）的帧会让播放卡在同一帧，必须作为问题上报。
     """
-
-    raise NotImplementedError
+    problems = []
+    frames = clip.get("frames") or []
+    if not frames:
+        problems.append("frames must not be empty")
+    for i, frame in enumerate(frames):
+        duration = frame.get("duration")
+        if (not isinstance(duration, int) or isinstance(duration, bool)
+                or duration <= 0):
+            problems.append(f"frame {i} has non-positive duration")
+    capacity = atlas["cols"] * atlas["rows"]
+    if len(frames) > capacity:
+        problems.append(
+            f"frame count {len(frames)} exceeds atlas capacity {capacity}")
+    loop = clip.get("loop")
+    if loop not in _LOOP_MODES:
+        problems.append(f"unknown loop: {loop}")
+    return problems
 
 
 def scale_durations(clip, ratio) -> dict:
@@ -128,8 +237,18 @@ def scale_durations(clip, ratio) -> dict:
 
     ``ratio`` 必须为正数、``frames`` 不能为空，否则抛 :class:`ClipError`。
     """
-
-    raise NotImplementedError
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) \
+            or not ratio > 0 or math.isnan(ratio):
+        raise ClipError(f"ratio must be a positive number, got {ratio!r}")
+    frames = clip.get("frames") or []
+    if not frames:
+        raise ClipError("frames must not be empty")
+    scaled = dict(clip)
+    scaled["frames"] = [
+        {**frame, "duration": max(1, math.floor(frame["duration"] * ratio + 0.5))}
+        for frame in frames
+    ]
+    return scaled
 
 
 def clip_batch(clips, atlas, fps) -> dict:
@@ -143,5 +262,11 @@ def clip_batch(clips, atlas, fps) -> dict:
     ``atlas`` 用于容量校验，``fps`` 必须为正整数；非法时抛
     :class:`ClipError`。
     """
-
-    raise NotImplementedError
+    if not isinstance(fps, int) or isinstance(fps, bool) or fps <= 0:
+        raise ClipError(f"fps must be a positive integer, got {fps!r}")
+    # 先整体校验：任一动画非法则整体回滚，不产生部分结果。
+    for name, clip in clips.items():
+        problems = validate_clip(clip, atlas)
+        if problems:
+            raise ClipError(f"clip {name!r} is invalid: {'; '.join(problems)}")
+    return {name: sync_to_fps(clip, fps) for name, clip in clips.items()}
